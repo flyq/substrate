@@ -24,8 +24,9 @@
 use codec::{Decode, Encode};
 use frame_support::{
 	decl_error, decl_module, decl_storage,
+	dispatch::DispatchResultWithPostInfo,
 	traits::{FindAuthor, Get, KeyOwnerProofSystem, Randomness as RandomnessT},
-	weights::Weight,
+	weights::{Pays, Weight},
 	Parameter,
 };
 use frame_system::{ensure_none, ensure_signed};
@@ -50,6 +51,7 @@ use sp_inherents::{InherentData, InherentIdentifier, MakeFatalError, ProvideInhe
 pub use sp_consensus_babe::{AuthorityId, PUBLIC_KEY_LENGTH, RANDOMNESS_LENGTH, VRF_OUTPUT_LENGTH};
 
 mod equivocation;
+mod default_weights;
 
 #[cfg(any(feature = "runtime-benchmarks", test))]
 mod benchmarking;
@@ -101,6 +103,12 @@ pub trait Trait: pallet_timestamp::Trait {
 	/// `()`) you must use this pallet's `ValidateUnsigned` in the runtime
 	/// definition.
 	type HandleEquivocation: HandleEquivocation<Self>;
+
+	type WeightInfo: WeightInfo;
+}
+
+pub trait WeightInfo {
+	fn report_equivocation(validator_count: u32) -> Weight;
 }
 
 /// Trigger an epoch change, if any should take place.
@@ -202,6 +210,11 @@ decl_storage! {
 		/// if per-block initialization has already been called for current block.
 		Initialized get(fn initialized): Option<MaybeRandomness>;
 
+		/// Temporary value (cleared at block finalization) that includes the VRF output generated
+		/// at this block. This field should always be populated during block processing unless
+		/// secondary plain slots are enabled (which don't contain a VRF output).
+		AuthorVrfRandomness get(fn author_vrf_randomness): MaybeRandomness;
+
 		/// How late the current block is compared to its parent.
 		///
 		/// This entry is populated as part of block execution and is cleaned up
@@ -247,6 +260,9 @@ decl_module! {
 				Self::deposit_randomness(&randomness);
 			}
 
+			// The stored author generated VRF output is ephemeral.
+			AuthorVrfRandomness::kill();
+
 			// remove temporary "environment" entry from storage
 			Lateness::<T>::kill();
 		}
@@ -255,19 +271,19 @@ decl_module! {
 		/// the equivocation proof and validate the given key ownership proof
 		/// against the extracted offender. If both are valid, the offence will
 		/// be reported.
-		#[weight = weight::weight_for_report_equivocation::<T>()]
+		#[weight = <T as Trait>::WeightInfo::report_equivocation(key_owner_proof.validator_count())]
 		fn report_equivocation(
 			origin,
 			equivocation_proof: EquivocationProof<T::Header>,
 			key_owner_proof: T::KeyOwnerProof,
-		) {
+		) -> DispatchResultWithPostInfo {
 			let reporter = ensure_signed(origin)?;
 
 			Self::do_report_equivocation(
 				Some(reporter),
 				equivocation_proof,
 				key_owner_proof,
-			)?;
+			)
 		}
 
 		/// Report authority equivocation/misbehavior. This method will verify
@@ -278,41 +294,20 @@ decl_module! {
 		/// block authors will call it (validated in `ValidateUnsigned`), as such
 		/// if the block author is defined it will be defined as the equivocation
 		/// reporter.
-		#[weight = weight::weight_for_report_equivocation::<T>()]
+		#[weight = <T as Trait>::WeightInfo::report_equivocation(key_owner_proof.validator_count())]
 		fn report_equivocation_unsigned(
 			origin,
 			equivocation_proof: EquivocationProof<T::Header>,
 			key_owner_proof: T::KeyOwnerProof,
-		) {
+		) -> DispatchResultWithPostInfo {
 			ensure_none(origin)?;
 
 			Self::do_report_equivocation(
 				T::HandleEquivocation::block_author(),
 				equivocation_proof,
 				key_owner_proof,
-			)?;
+			)
 		}
-	}
-}
-
-mod weight {
-	use frame_support::{
-		traits::Get,
-		weights::{constants::WEIGHT_PER_MICROS, Weight},
-	};
-
-	pub fn weight_for_report_equivocation<T: super::Trait>() -> Weight {
-		// checking membership proof
-		(35 * WEIGHT_PER_MICROS)
-			.saturating_add(T::DbWeight::get().reads(5))
-			// check equivocation proof
-			.saturating_add(110 * WEIGHT_PER_MICROS)
-			// report offence
-			.saturating_add(110 * WEIGHT_PER_MICROS)
-			// worst case we are considering is that the given offender
-			// is backed by 200 nominators
-			.saturating_add(T::DbWeight::get().reads(14 + 3 * 200))
-			.saturating_add(T::DbWeight::get().writes(10 + 3 * 200))
 	}
 }
 
@@ -384,7 +379,7 @@ impl<T: Trait> Module<T> {
 	pub fn slot_duration() -> T::Moment {
 		// we double the minimum block-period so each author can always propose within
 		// the majority of their slot.
-		<T as pallet_timestamp::Trait>::MinimumPeriod::get().saturating_mul(2.into())
+		<T as pallet_timestamp::Trait>::MinimumPeriod::get().saturating_mul(2u32.into())
 	}
 
 	/// Determine whether an epoch change should take place at this block.
@@ -530,7 +525,9 @@ impl<T: Trait> Module<T> {
 			})
 			.next();
 
-		let maybe_randomness: Option<schnorrkel::Randomness> = maybe_pre_digest.and_then(|digest| {
+		let is_primary = matches!(maybe_pre_digest, Some(PreDigest::Primary(..)));
+
+		let maybe_randomness: MaybeRandomness = maybe_pre_digest.and_then(|digest| {
 			// on the first non-zero block (i.e. block #1)
 			// this is where the first epoch (epoch #0) actually starts.
 			// we need to adjust internal storage accordingly.
@@ -559,38 +556,44 @@ impl<T: Trait> Module<T> {
 			Lateness::<T>::put(lateness);
 			CurrentSlot::put(current_slot);
 
-			if let PreDigest::Primary(primary) = digest {
-				// place the VRF output into the `Initialized` storage item
-				// and it'll be put onto the under-construction randomness
-				// later, once we've decided which epoch this block is in.
-				//
-				// Reconstruct the bytes of VRFInOut using the authority id.
-				Authorities::get()
-					.get(primary.authority_index as usize)
-					.and_then(|author| {
-						schnorrkel::PublicKey::from_bytes(author.0.as_slice()).ok()
-					})
-					.and_then(|pubkey| {
-						let transcript = sp_consensus_babe::make_transcript(
-							&Self::randomness(),
-							current_slot,
-							EpochIndex::get(),
-						);
+			let authority_index = digest.authority_index();
 
-						primary.vrf_output.0.attach_input_hash(
-							&pubkey,
-							transcript
-						).ok()
-					})
-					.map(|inout| {
-						inout.make_bytes(&sp_consensus_babe::BABE_VRF_INOUT_CONTEXT)
-					})
-			} else {
-				None
-			}
+			// Extract out the VRF output if we have it
+			digest
+				.vrf_output()
+				.and_then(|vrf_output| {
+					// Reconstruct the bytes of VRFInOut using the authority id.
+					Authorities::get()
+						.get(authority_index as usize)
+						.and_then(|author| {
+							schnorrkel::PublicKey::from_bytes(author.0.as_slice()).ok()
+						})
+						.and_then(|pubkey| {
+							let transcript = sp_consensus_babe::make_transcript(
+								&Self::randomness(),
+								current_slot,
+								EpochIndex::get(),
+							);
+
+							vrf_output.0.attach_input_hash(
+								&pubkey,
+								transcript
+							).ok()
+						})
+						.map(|inout| {
+							inout.make_bytes(&sp_consensus_babe::BABE_VRF_INOUT_CONTEXT)
+						})
+				})
 		});
 
-		Initialized::put(maybe_randomness);
+		// For primary VRF output we place it in the `Initialized` storage
+		// item and it'll be put onto the under-construction randomness later,
+		// once we've decided which epoch this block is in.
+		Initialized::put(if is_primary { maybe_randomness } else { None });
+
+		// Place either the primary or secondary VRF output into the
+		// `AuthorVrfRandomness` storage item.
+		AuthorVrfRandomness::put(maybe_randomness);
 
 		// enact epoch change, if necessary.
 		T::EpochChangeTrigger::trigger::<T>(now)
@@ -626,13 +629,13 @@ impl<T: Trait> Module<T> {
 		reporter: Option<T::AccountId>,
 		equivocation_proof: EquivocationProof<T::Header>,
 		key_owner_proof: T::KeyOwnerProof,
-	) -> Result<(), Error<T>> {
+	) -> DispatchResultWithPostInfo {
 		let offender = equivocation_proof.offender.clone();
 		let slot_number = equivocation_proof.slot_number;
 
 		// validate the equivocation proof
 		if !sp_consensus_babe::check_equivocation_proof(equivocation_proof) {
-			return Err(Error::InvalidEquivocationProof.into());
+			return Err(Error::<T>::InvalidEquivocationProof.into());
 		}
 
 		let validator_set_count = key_owner_proof.validator_count();
@@ -644,13 +647,13 @@ impl<T: Trait> Module<T> {
 		// check that the slot number is consistent with the session index
 		// in the key ownership proof (i.e. slot is for that epoch)
 		if epoch_index != session_index {
-			return Err(Error::InvalidKeyOwnershipProof.into());
+			return Err(Error::<T>::InvalidKeyOwnershipProof.into());
 		}
 
 		// check the membership proof and extract the offender's id
 		let key = (sp_consensus_babe::KEY_TYPE, offender);
 		let offender = T::KeyOwnerProofSystem::check_proof(key, key_owner_proof)
-			.ok_or(Error::InvalidKeyOwnershipProof)?;
+			.ok_or(Error::<T>::InvalidKeyOwnershipProof)?;
 
 		let offence = BabeEquivocationOffence {
 			slot: slot_number,
@@ -665,9 +668,10 @@ impl<T: Trait> Module<T> {
 		};
 
 		T::HandleEquivocation::report_offence(reporters, offence)
-			.map_err(|_| Error::DuplicateOffenceReport)?;
+			.map_err(|_| Error::<T>::DuplicateOffenceReport)?;
 
-		Ok(())
+		// waive the fee since the report is valid and beneficial
+		Ok(Pays::No.into())
 	}
 
 	/// Submits an extrinsic to report an equivocation. This method will create

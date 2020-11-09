@@ -23,7 +23,7 @@ use crate::{
 use sp_std::prelude::*;
 use sp_io::hashing::blake2_256;
 use frame_support::storage::child;
-use frame_support::traits::{Currency, ExistenceRequirement, Get, OnUnbalanced, WithdrawReason};
+use frame_support::traits::{Currency, ExistenceRequirement, Get, OnUnbalanced, WithdrawReasons};
 use frame_support::StorageMap;
 use pallet_contracts_primitives::{ContractAccessError, RentProjection, RentProjectionResult};
 use sp_runtime::traits::{Bounded, CheckedDiv, CheckedMul, SaturatedConversion, Saturating, Zero};
@@ -54,7 +54,7 @@ impl<T: Trait> OutstandingAmount<T> {
 		if let Ok(imbalance) = T::Currency::withdraw(
 			account,
 			self.amount,
-			WithdrawReason::Fee.into(),
+			WithdrawReasons::FEE,
 			ExistenceRequirement::KeepAlive,
 		) {
 			// This should never fail. However, let's err on the safe side.
@@ -104,7 +104,7 @@ fn compute_fee_per_block<T: Trait>(
 
 	effective_storage_size
 		.checked_mul(&T::RentByteFee::get())
-		.unwrap_or(<BalanceOf<T>>::max_value())
+		.unwrap_or_else(|| <BalanceOf<T>>::max_value())
 }
 
 /// Returns amount of funds available to consume by rent mechanism.
@@ -179,7 +179,7 @@ fn consider_case<T: Trait>(
 
 	let dues = fee_per_block
 		.checked_mul(&blocks_passed.saturated_into::<u32>().into())
-		.unwrap_or(<BalanceOf<T>>::max_value());
+		.unwrap_or_else(|| <BalanceOf<T>>::max_value());
 	let insufficient_rent = rent_budget < dues;
 
 	// If the rent payment cannot be withdrawn due to locks on the account balance, then evict the
@@ -192,7 +192,7 @@ fn consider_case<T: Trait>(
 	let can_withdraw_rent = T::Currency::ensure_can_withdraw(
 		account,
 		dues_limited,
-		WithdrawReason::Fee.into(),
+		WithdrawReasons::FEE,
 		free_balance.saturating_sub(dues_limited),
 	)
 	.is_ok();

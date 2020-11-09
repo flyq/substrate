@@ -15,7 +15,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::write_file_if_changed;
+use crate::{write_file_if_changed, CargoCommandVersioned};
 
 use std::{
 	fs, path::{Path, PathBuf}, borrow::ToOwned, process, env, collections::HashSet,
@@ -33,6 +33,17 @@ use walkdir::WalkDir;
 use fs2::FileExt;
 
 use itertools::Itertools;
+
+/// Colorize an info message.
+///
+/// Returns the colorized message.
+fn colorize_info_message(message: &str) -> String {
+	if super::color_output_enabled() {
+		ansi_term::Color::Yellow.bold().paint(message).to_string()
+	} else {
+		message.into()
+	}
+}
 
 /// Holds the path to the bloaty WASM binary.
 pub struct WasmBinaryBloaty(PathBuf);
@@ -84,36 +95,58 @@ impl Drop for WorkspaceLock {
 	}
 }
 
-/// Creates the WASM project, compiles the WASM binary and compacts the WASM binary.
-///
-/// # Returns
-/// The path to the compact WASM binary and the bloaty WASM binary.
-pub fn create_and_compile(
-	cargo_manifest: &Path,
-	default_rustflags: &str,
-) -> (WasmBinary, WasmBinaryBloaty) {
-	let wasm_workspace_root = get_wasm_workspace_root();
-	let wasm_workspace = wasm_workspace_root.join("wbuild");
+fn crate_metadata(cargo_manifest: &Path) -> Metadata {
+	let mut cargo_lock = cargo_manifest.to_path_buf();
+	cargo_lock.set_file_name("Cargo.lock");
 
-	// Lock the workspace exclusively for us
-	let _lock = WorkspaceLock::new(&wasm_workspace_root);
+	let cargo_lock_existed = cargo_lock.exists();
 
 	let crate_metadata = MetadataCommand::new()
 		.manifest_path(cargo_manifest)
 		.exec()
 		.expect("`cargo metadata` can not fail on project `Cargo.toml`; qed");
 
+	// If the `Cargo.lock` didn't exist, we need to remove it after
+	// calling `cargo metadata`. This is required to ensure that we don't change
+	// the build directory outside of the `target` folder. Commands like
+	// `cargo publish` require this.
+	if !cargo_lock_existed {
+		let _ = fs::remove_file(&cargo_lock);
+	}
+
+	crate_metadata
+}
+
+/// Creates the WASM project, compiles the WASM binary and compacts the WASM binary.
+///
+/// # Returns
+/// The path to the compact WASM binary and the bloaty WASM binary.
+pub(crate) fn create_and_compile(
+	cargo_manifest: &Path,
+	default_rustflags: &str,
+	cargo_cmd: CargoCommandVersioned,
+) -> (Option<WasmBinary>, WasmBinaryBloaty) {
+	let wasm_workspace_root = get_wasm_workspace_root();
+	let wasm_workspace = wasm_workspace_root.join("wbuild");
+
+	// Lock the workspace exclusively for us
+	let _lock = WorkspaceLock::new(&wasm_workspace_root);
+
+	let crate_metadata = crate_metadata(cargo_manifest);
+
 	let project = create_project(cargo_manifest, &wasm_workspace, &crate_metadata);
 	create_wasm_workspace_project(&wasm_workspace, &crate_metadata.workspace_root);
 
-	build_project(&project, default_rustflags);
+	build_project(&project, default_rustflags, cargo_cmd);
 	let (wasm_binary, bloaty) = compact_wasm_file(
 		&project,
 		cargo_manifest,
 		&wasm_workspace,
 	);
 
-	copy_wasm_to_target_directory(cargo_manifest, &wasm_binary);
+	wasm_binary.as_ref().map(|wasm_binary|
+		copy_wasm_to_target_directory(cargo_manifest, wasm_binary)
+	);
 
 	generate_rerun_if_changed_instructions(cargo_manifest, &project, &wasm_workspace);
 
@@ -205,7 +238,7 @@ fn find_and_clear_workspace_members(wasm_workspace: &Path) -> Vec<String> {
 		.map(|d| d.into_path())
 		.filter(|p| p.is_dir())
 		.filter_map(|p| p.file_name().map(|f| f.to_owned()).and_then(|s| s.into_string().ok()))
-		.filter(|f| !f.starts_with(".") && f != "target")
+		.filter(|f| !f.starts_with('.') && f != "target")
 		.collect::<Vec<_>>();
 
 	let mut i = 0;
@@ -402,7 +435,7 @@ fn create_project(cargo_manifest: &Path, wasm_workspace: &Path, crate_metadata: 
 
 	write_file_if_changed(
 		project_folder.join("src/lib.rs"),
-		"#![no_std] pub use wasm_project::*;".into(),
+		"#![no_std] pub use wasm_project::*;",
 	);
 
 	if let Some(crate_lock_file) = find_cargo_lock(cargo_manifest) {
@@ -431,9 +464,9 @@ fn is_release_build() -> bool {
 }
 
 /// Build the project to create the WASM binary.
-fn build_project(project: &Path, default_rustflags: &str) {
+fn build_project(project: &Path, default_rustflags: &str, cargo_cmd: CargoCommandVersioned) {
 	let manifest_path = project.join("Cargo.toml");
-	let mut build_cmd = crate::get_nightly_cargo().command();
+	let mut build_cmd = cargo_cmd.command();
 
 	let rustflags = format!(
 		"-C link-arg=--export-table {} {}",
@@ -447,7 +480,7 @@ fn build_project(project: &Path, default_rustflags: &str) {
 		// We don't want to call ourselves recursively
 		.env(crate::SKIP_BUILD_ENV, "");
 
-	if env::var(crate::WASM_BUILD_NO_COLOR).is_err() {
+	if super::color_output_enabled() {
 		build_cmd.arg("--color=always");
 	}
 
@@ -455,7 +488,9 @@ fn build_project(project: &Path, default_rustflags: &str) {
 		build_cmd.arg("--release");
 	};
 
-	println!("Executing build command: {:?}", build_cmd);
+	println!("{}", colorize_info_message("Information that should be included in a bug report."));
+	println!("{} {:?}", colorize_info_message("Executing build command:"), build_cmd);
+	println!("{} {}", colorize_info_message("Using rustc version:"), cargo_cmd.rustc_version());
 
 	match build_cmd.status().map(|s| s.success()) {
 		Ok(true) => {},
@@ -469,18 +504,23 @@ fn compact_wasm_file(
 	project: &Path,
 	cargo_manifest: &Path,
 	wasm_workspace: &Path,
-) -> (WasmBinary, WasmBinaryBloaty) {
-	let target = if is_release_build() { "release" } else { "debug" };
+) -> (Option<WasmBinary>, WasmBinaryBloaty) {
+	let is_release_build = is_release_build();
+	let target = if is_release_build { "release" } else { "debug" };
 	let wasm_binary = get_wasm_binary_name(cargo_manifest);
 	let wasm_file = wasm_workspace.join("target/wasm32-unknown-unknown")
 		.join(target)
 		.join(format!("{}.wasm", wasm_binary));
-	let wasm_compact_file = project.join(format!("{}.compact.wasm", wasm_binary));
+	let wasm_compact_file = if is_release_build {
+		let wasm_compact_file = project.join(format!("{}.compact.wasm", wasm_binary));
+		wasm_gc::garbage_collect_file(&wasm_file, &wasm_compact_file)
+			.expect("Failed to compact generated WASM binary.");
+		Some(WasmBinary(wasm_compact_file))
+	} else {
+		None
+	};
 
-	wasm_gc::garbage_collect_file(&wasm_file, &wasm_compact_file)
-		.expect("Failed to compact generated WASM binary.");
-
-	(WasmBinary(wasm_compact_file), WasmBinaryBloaty(wasm_file))
+	(wasm_compact_file, WasmBinaryBloaty(wasm_file))
 }
 
 /// Custom wrapper for a [`cargo_metadata::Package`] to store it in

@@ -29,6 +29,7 @@
 //!   - A means of updating the fee for the next block, via defining a multiplier, based on the
 //!     final state of the chain at the end of the previous block. This can be configured via
 //!     [`Trait::FeeMultiplierUpdate`]
+//!   - How the fees are paid via [`Trait::OnChargeTransaction`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -36,7 +37,7 @@ use sp_std::prelude::*;
 use codec::{Encode, Decode};
 use frame_support::{
 	decl_storage, decl_module,
-	traits::{Currency, Get, OnUnbalanced, ExistenceRequirement, WithdrawReason, Imbalance},
+	traits::Get,
 	weights::{
 		Weight, DispatchInfo, PostDispatchInfo, GetDispatchInfo, Pays, WeightToFeePolynomial,
 		WeightToFeeCoefficient,
@@ -46,23 +47,23 @@ use frame_support::{
 use sp_runtime::{
 	FixedU128, FixedPointNumber, FixedPointOperand, Perquintill, RuntimeDebug,
 	transaction_validity::{
-		TransactionPriority, ValidTransaction, InvalidTransaction, TransactionValidityError,
-		TransactionValidity,
+		TransactionPriority, ValidTransaction, TransactionValidityError, TransactionValidity,
 	},
 	traits::{
-		Zero, Saturating, SignedExtension, SaturatedConversion, Convert, Dispatchable,
+		Saturating, SignedExtension, SaturatedConversion, Convert, Dispatchable,
 		DispatchInfoOf, PostDispatchInfoOf,
 	},
 };
 use pallet_transaction_payment_rpc_runtime_api::RuntimeDispatchInfo;
 
+mod payment;
+pub use payment::*;
+
 /// Fee multiplier.
 pub type Multiplier = FixedU128;
 
 type BalanceOf<T> =
-	<<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::Balance;
-type NegativeImbalanceOf<T> =
-	<<T as Trait>::Currency as Currency<<T as frame_system::Trait>::AccountId>>::NegativeImbalance;
+	<<T as Trait>::OnChargeTransaction as OnChargeTransaction<T>>::Balance;
 
 /// A struct to update the weight multiplier per block. It implements `Convert<Multiplier,
 /// Multiplier>`, meaning that it can convert the previous multiplier to the next one. This should
@@ -110,6 +111,42 @@ type NegativeImbalanceOf<T> =
 /// More info can be found at:
 /// https://w3f-research.readthedocs.io/en/latest/polkadot/Token%20Economics.html
 pub struct TargetedFeeAdjustment<T, S, V, M>(sp_std::marker::PhantomData<(T, S, V, M)>);
+
+/// Something that can convert the current multiplier to the next one.
+pub trait MultiplierUpdate: Convert<Multiplier, Multiplier> {
+	/// Minimum multiplier
+	fn min() -> Multiplier;
+	/// Target block saturation level
+	fn target() -> Perquintill;
+	/// Variability factor
+	fn variability() -> Multiplier;
+}
+
+impl MultiplierUpdate for () {
+	fn min() -> Multiplier {
+		Default::default()
+	}
+	fn target() -> Perquintill {
+		Default::default()
+	}
+	fn variability() -> Multiplier {
+		Default::default()
+	}
+}
+
+impl<T, S, V, M> MultiplierUpdate for TargetedFeeAdjustment<T, S, V, M>
+	where T: frame_system::Trait, S: Get<Perquintill>, V: Get<Multiplier>, M: Get<Multiplier>,
+{
+	fn min() -> Multiplier {
+		M::get()
+	}
+	fn target() -> Perquintill {
+		S::get()
+	}
+	fn variability() -> Multiplier {
+		V::get()
+	}
+}
 
 impl<T, S, V, M> Convert<Multiplier, Multiplier> for TargetedFeeAdjustment<T, S, V, M>
 	where T: frame_system::Trait, S: Get<Perquintill>, V: Get<Multiplier>, M: Get<Multiplier>,
@@ -177,13 +214,13 @@ impl Default for Releases {
 }
 
 pub trait Trait: frame_system::Trait {
-	/// The currency type in which fees will be paid.
-	type Currency: Currency<Self::AccountId> + Send + Sync;
-
-	/// Handler for the unbalanced reduction when taking transaction fees. This is either one or
-	/// two separate imbalances, the first is the transaction fee paid, the second is the tip paid,
-	/// if any.
-	type OnTransactionPayment: OnUnbalanced<NegativeImbalanceOf<Self>>;
+	/// Handler for withdrawing, refunding and depositing the transaction fee.
+	/// Transaction fees are withdrawn before the transaction is executed.
+	/// After the transaction was executed the transaction weight can be
+	/// adjusted, depending on the used resources by the transaction. If the
+	/// transaction weight is lower than expected, parts of the transaction fee
+	/// might be refunded. In the end the fees can be deposited.
+	type OnChargeTransaction: OnChargeTransaction<Self>;
 
 	/// The fee to be paid for making a transaction; the per-byte portion.
 	type TransactionByteFee: Get<BalanceOf<Self>>;
@@ -192,7 +229,7 @@ pub trait Trait: frame_system::Trait {
 	type WeightToFee: WeightToFeePolynomial<Balance=BalanceOf<Self>>;
 
 	/// Update the multiplier of the next block, based on the previous block's weight.
-	type FeeMultiplierUpdate: Convert<Multiplier, Multiplier>;
+	type FeeMultiplierUpdate: MultiplierUpdate;
 }
 
 decl_storage! {
@@ -229,6 +266,32 @@ decl_module! {
 					<T as frame_system::Trait>::MaximumBlockWeight::get().try_into().unwrap()
 				).unwrap(),
 			);
+
+			// This is the minimum value of the multiplier. Make sure that if we collapse to this
+			// value, we can recover with a reasonable amount of traffic. For this test we assert
+			// that if we collapse to minimum, the trend will be positive with a weight value
+			// which is 1% more than the target.
+			let min_value = T::FeeMultiplierUpdate::min();
+			let mut target =
+				T::FeeMultiplierUpdate::target() *
+				(T::AvailableBlockRatio::get() * T::MaximumBlockWeight::get());
+
+			// add 1 percent;
+			let addition = target / 100;
+			if addition == 0 {
+				// this is most likely because in a test setup we set everything to ().
+				return;
+			}
+			target += addition;
+
+			sp_io::TestExternalities::new_empty().execute_with(|| {
+				<frame_system::Module<T>>::set_block_limits(target, 0);
+				let next = T::FeeMultiplierUpdate::convert(min_value);
+				assert!(next > min_value, "The minimum bound of the multiplier is too low. When \
+					block saturation is more than target by 1% and multiplier is minimal then \
+					the multiplier doesn't increase."
+				);
+			})
 		}
 	}
 }
@@ -309,7 +372,7 @@ impl<T: Trait> Module<T> where
 	) -> BalanceOf<T> where
 		T::Call: Dispatchable<Info=DispatchInfo,PostInfo=PostDispatchInfo>,
 	{
-		Self::compute_fee_raw(len, post_info.calc_actual_weight(info), tip, info.pays_fee)
+		Self::compute_fee_raw(len, post_info.calc_actual_weight(info), tip, post_info.pays_fee(info))
 	}
 
 	fn compute_fee_raw(
@@ -380,30 +443,38 @@ impl<T: Trait + Send + Sync> ChargeTransactionPayment<T> where
 	fn withdraw_fee(
 		&self,
 		who: &T::AccountId,
+		call: &T::Call,
 		info: &DispatchInfoOf<T::Call>,
 		len: usize,
-	) -> Result<(BalanceOf<T>, Option<NegativeImbalanceOf<T>>), TransactionValidityError> {
+	) -> Result<
+		(
+			BalanceOf<T>,
+			<<T as Trait>::OnChargeTransaction as OnChargeTransaction<T>>::LiquidityInfo,
+		),
+		TransactionValidityError,
+	> {
 		let tip = self.0;
 		let fee = Module::<T>::compute_fee(len as u32, info, tip);
 
-		// Only mess with balances if fee is not zero.
-		if fee.is_zero() {
-			return Ok((fee, None));
-		}
+		<<T as Trait>::OnChargeTransaction as OnChargeTransaction<T>>::withdraw_fee(who, call, info, fee, tip)
+			.map(|i| (fee, i))
+	}
 
-		match T::Currency::withdraw(
-			who,
-			fee,
-			if tip.is_zero() {
-				WithdrawReason::TransactionPayment.into()
-			} else {
-				WithdrawReason::TransactionPayment | WithdrawReason::Tip
-			},
-			ExistenceRequirement::KeepAlive,
-		) {
-			Ok(imbalance) => Ok((fee, Some(imbalance))),
-			Err(_) => Err(InvalidTransaction::Payment.into()),
-		}
+	/// Get an appropriate priority for a transaction with the given length and info.
+	///
+	/// This will try and optimise the `fee/weight` `fee/length`, whichever is consuming more of the
+	/// maximum corresponding limit.
+	///
+	/// For example, if a transaction consumed 1/4th of the block length and half of the weight, its
+	/// final priority is `fee * min(2, 4) = fee * 2`. If it consumed `1/4th` of the block length
+	/// and the entire block weight `(1/1)`, its priority is `fee * min(1, 4) = fee * 1`. This means
+	///  that the transaction which consumes more resources (either length or weight) with the same
+	/// `fee` ends up having lower priority.
+	fn get_priority(len: usize, info: &DispatchInfoOf<T::Call>, final_fee: BalanceOf<T>) -> TransactionPriority {
+		let weight_saturation = T::MaximumBlockWeight::get() / info.weight.max(1);
+		let len_saturation = T::MaximumBlockLength::get() as u64 / (len as u64).max(1);
+		let coefficient: BalanceOf<T> = weight_saturation.min(len_saturation).saturated_into::<BalanceOf<T>>();
+		final_fee.saturating_mul(coefficient).saturated_into::<TransactionPriority>()
 	}
 }
 
@@ -426,34 +497,39 @@ impl<T: Trait + Send + Sync> SignedExtension for ChargeTransactionPayment<T> whe
 	type AccountId = T::AccountId;
 	type Call = T::Call;
 	type AdditionalSigned = ();
-	type Pre = (BalanceOf<T>, Self::AccountId, Option<NegativeImbalanceOf<T>>, BalanceOf<T>);
+	type Pre = (
+		// tip
+		BalanceOf<T>,
+		// who paid the fee
+		Self::AccountId,
+		// imbalance resulting from withdrawing the fee
+		<<T as Trait>::OnChargeTransaction as OnChargeTransaction<T>>::LiquidityInfo,
+	);
 	fn additional_signed(&self) -> sp_std::result::Result<(), TransactionValidityError> { Ok(()) }
 
 	fn validate(
 		&self,
 		who: &Self::AccountId,
-		_call: &Self::Call,
+		call: &Self::Call,
 		info: &DispatchInfoOf<Self::Call>,
 		len: usize,
 	) -> TransactionValidity {
-		let (fee, _) = self.withdraw_fee(who, info, len)?;
-
-		let mut r = ValidTransaction::default();
-		// NOTE: we probably want to maximize the _fee (of any type) per weight unit_ here, which
-		// will be a bit more than setting the priority to tip. For now, this is enough.
-		r.priority = fee.saturated_into::<TransactionPriority>();
-		Ok(r)
+		let (fee, _) = self.withdraw_fee(who, call, info, len)?;
+		Ok(ValidTransaction {
+			priority: Self::get_priority(len, info, fee),
+			..Default::default()
+		})
 	}
 
 	fn pre_dispatch(
 		self,
 		who: &Self::AccountId,
-		_call: &Self::Call,
+		call: &Self::Call,
 		info: &DispatchInfoOf<Self::Call>,
 		len: usize
 	) -> Result<Self::Pre, TransactionValidityError> {
-		let (fee, imbalance) = self.withdraw_fee(who, info, len)?;
-		Ok((self.0, who.clone(), imbalance, fee))
+		let (_fee, imbalance) = self.withdraw_fee(who, call, info, len)?;
+		Ok((self.0, who.clone(), imbalance))
 	}
 
 	fn post_dispatch(
@@ -463,32 +539,14 @@ impl<T: Trait + Send + Sync> SignedExtension for ChargeTransactionPayment<T> whe
 		len: usize,
 		_result: &DispatchResult,
 	) -> Result<(), TransactionValidityError> {
-		let (tip, who, imbalance, fee) = pre;
-		if let Some(payed) = imbalance {
-			let actual_fee = Module::<T>::compute_actual_fee(
-				len as u32,
-				info,
-				post_info,
-				tip,
-			);
-			let refund = fee.saturating_sub(actual_fee);
-			let actual_payment = match T::Currency::deposit_into_existing(&who, refund) {
-				Ok(refund_imbalance) => {
-					// The refund cannot be larger than the up front payed max weight.
-					// `PostDispatchInfo::calc_unspent` guards against such a case.
-					match payed.offset(refund_imbalance) {
-						Ok(actual_payment) => actual_payment,
-						Err(_) => return Err(InvalidTransaction::Payment.into()),
-					}
-				}
-				// We do not recreate the account using the refund. The up front payment
-				// is gone in that case.
-				Err(_) => payed,
-			};
-			let imbalances = actual_payment.split(tip);
-			T::OnTransactionPayment::on_unbalanceds(Some(imbalances.0).into_iter()
-				.chain(Some(imbalances.1)));
-		}
+		let (tip, who, imbalance) = pre;
+		let actual_fee = Module::<T>::compute_actual_fee(
+			len as u32,
+			info,
+			post_info,
+			tip,
+		);
+		T::OnChargeTransaction::correct_and_deposit_fee(&who, info, post_info, actual_fee, tip, imbalance)?;
 		Ok(())
 	}
 }
@@ -503,6 +561,7 @@ mod tests {
 			DispatchClass, DispatchInfo, PostDispatchInfo, GetDispatchInfo, Weight,
 			WeightToFeePolynomial, WeightToFeeCoefficients, WeightToFeeCoefficient,
 		},
+		traits::Currency,
 	};
 	use pallet_balances::Call as BalancesCall;
 	use pallet_transaction_payment_rpc_runtime_api::RuntimeDispatchInfo;
@@ -577,7 +636,7 @@ mod tests {
 		type MaximumBlockLength = MaximumBlockLength;
 		type AvailableBlockRatio = AvailableBlockRatio;
 		type Version = ();
-		type ModuleToIndex = ();
+		type PalletInfo = ();
 		type AccountData = pallet_balances::AccountData<u64>;
 		type OnNewAccount = ();
 		type OnKilledAccount = ();
@@ -594,6 +653,7 @@ mod tests {
 		type DustRemoval = ();
 		type ExistentialDeposit = ExistentialDeposit;
 		type AccountStore = System;
+		type MaxLocks = ();
 		type WeightInfo = ();
 	}
 	thread_local! {
@@ -621,8 +681,7 @@ mod tests {
 	}
 
 	impl Trait for Runtime {
-		type Currency = pallet_balances::Module<Runtime>;
-		type OnTransactionPayment = ();
+		type OnChargeTransaction = CurrencyAdapter<Balances, ()>;
 		type TransactionByteFee = TransactionByteFee;
 		type WeightToFee = WeightToFee;
 		type FeeMultiplierUpdate = ();
@@ -700,11 +759,24 @@ mod tests {
 	}
 
 	fn post_info_from_weight(w: Weight) -> PostDispatchInfo {
-		PostDispatchInfo { actual_weight: Some(w), }
+		PostDispatchInfo {
+			actual_weight: Some(w),
+			pays_fee: Default::default(),
+		}
+	}
+
+	fn post_info_from_pays(p: Pays) -> PostDispatchInfo {
+		PostDispatchInfo {
+			actual_weight: None,
+			pays_fee: p,
+		}
 	}
 
 	fn default_post_info() -> PostDispatchInfo {
-		PostDispatchInfo { actual_weight: None, }
+		PostDispatchInfo {
+			actual_weight: None,
+			pays_fee: Default::default(),
+		}
 	}
 
 	#[test]
@@ -1146,6 +1218,40 @@ mod tests {
 
 			// 33 weight, 10 length, 7 base, 5 tip
 			assert_eq!(actual_fee, 7 + 10 + (33 * 5 / 4) + 5);
+			assert_eq!(refund_based_fee, actual_fee);
+		});
+	}
+
+	#[test]
+	fn post_info_can_change_pays_fee() {
+		ExtBuilder::default()
+			.balance_factor(10)
+			.base_weight(7)
+			.build()
+			.execute_with(||
+		{
+			let info = info_from_weight(100);
+			let post_info = post_info_from_pays(Pays::No);
+			let prev_balance = Balances::free_balance(2);
+			let len = 10;
+			let tip = 5;
+
+			NextFeeMultiplier::put(Multiplier::saturating_from_rational(5, 4));
+
+			let pre = ChargeTransactionPayment::<Runtime>::from(tip)
+				.pre_dispatch(&2, CALL, &info, len)
+				.unwrap();
+
+			ChargeTransactionPayment::<Runtime>
+				::post_dispatch(pre, &info, &post_info, len, &Ok(()))
+				.unwrap();
+
+			let refund_based_fee = prev_balance - Balances::free_balance(2);
+			let actual_fee = Module::<Runtime>
+				::compute_actual_fee(len as u32, &info, &post_info, tip);
+
+			// Only 5 tip is paid
+			assert_eq!(actual_fee, 5);
 			assert_eq!(refund_based_fee, actual_fee);
 		});
 	}

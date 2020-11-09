@@ -79,7 +79,7 @@
 //! - [`Imbalance`](../frame_support/traits/trait.Imbalance.html): Functions for handling
 //! imbalances between total issuance in the system and account balances. Must be used when a function
 //! creates new funds (e.g. a reward) or destroys some funds (e.g. a system fee).
-//! - [`IsDeadAccount`](../frame_system/trait.IsDeadAccount.html): Determiner to say whether a
+//! - [`IsDeadAccount`](../frame_support/traits/trait.IsDeadAccount.html): Determiner to say whether a
 //! given account is unused.
 //!
 //! ## Interface
@@ -154,16 +154,16 @@ mod tests;
 mod tests_local;
 mod tests_composite;
 mod benchmarking;
+pub mod weights;
 
 use sp_std::prelude::*;
 use sp_std::{cmp, result, mem, fmt::Debug, ops::BitOr, convert::Infallible};
 use codec::{Codec, Encode, Decode};
 use frame_support::{
 	StorageValue, Parameter, decl_event, decl_storage, decl_module, decl_error, ensure,
-	weights::Weight,
 	traits::{
 		Currency, OnKilledAccount, OnUnbalanced, TryDrop, StoredMap,
-		WithdrawReason, WithdrawReasons, LockIdentifier, LockableCurrency, ExistenceRequirement,
+		WithdrawReasons, LockIdentifier, LockableCurrency, ExistenceRequirement,
 		Imbalance, SignedImbalance, ReservableCurrency, Get, ExistenceRequirement::KeepAlive,
 		ExistenceRequirement::AllowDeath, IsDeadAccount, BalanceStatus as Status,
 	}
@@ -176,24 +176,8 @@ use sp_runtime::{
 	},
 };
 use frame_system::{self as system, ensure_signed, ensure_root};
-
 pub use self::imbalances::{PositiveImbalance, NegativeImbalance};
-
-pub trait WeightInfo {
-	fn transfer(u: u32, e: u32, ) -> Weight;
-	fn transfer_best_case(u: u32, e: u32, ) -> Weight;
-	fn transfer_keep_alive(u: u32, e: u32, ) -> Weight;
-	fn set_balance(u: u32, e: u32, ) -> Weight;
-	fn set_balance_killing(u: u32, e: u32, ) -> Weight;
-}
-
-impl WeightInfo for () {
-	fn transfer(_u: u32, _e: u32, ) -> Weight { 1_000_000_000 }
-	fn transfer_best_case(_u: u32, _e: u32, ) -> Weight { 1_000_000_000 }
-	fn transfer_keep_alive(_u: u32, _e: u32, ) -> Weight { 1_000_000_000 }
-	fn set_balance(_u: u32, _e: u32, ) -> Weight { 1_000_000_000 }
-	fn set_balance_killing(_u: u32, _e: u32, ) -> Weight { 1_000_000_000 }
-}
+pub use weights::WeightInfo;
 
 pub trait Subtrait<I: Instance = DefaultInstance>: frame_system::Trait {
 	/// The balance of an account.
@@ -208,6 +192,10 @@ pub trait Subtrait<I: Instance = DefaultInstance>: frame_system::Trait {
 
 	/// Weight information for the extrinsics in this pallet.
 	type WeightInfo: WeightInfo;
+
+	/// The maximum number of locks that should exist on an account.
+	/// Not strictly enforced, but used for weight estimation.
+	type MaxLocks: Get<u32>;
 }
 
 pub trait Trait<I: Instance = DefaultInstance>: frame_system::Trait {
@@ -229,6 +217,10 @@ pub trait Trait<I: Instance = DefaultInstance>: frame_system::Trait {
 
 	/// Weight information for extrinsics in this pallet.
 	type WeightInfo: WeightInfo;
+
+	/// The maximum number of locks that should exist on an account.
+	/// Not strictly enforced, but used for weight estimation.
+	type MaxLocks: Get<u32>;
 }
 
 impl<T: Trait<I>, I: Instance> Subtrait<I> for T {
@@ -236,6 +228,7 @@ impl<T: Trait<I>, I: Instance> Subtrait<I> for T {
 	type ExistentialDeposit = T::ExistentialDeposit;
 	type AccountStore = T::AccountStore;
 	type WeightInfo = <T as Trait<I>>::WeightInfo;
+	type MaxLocks = T::MaxLocks;
 }
 
 decl_event!(
@@ -243,23 +236,24 @@ decl_event!(
 		<T as frame_system::Trait>::AccountId,
 		<T as Trait<I>>::Balance
 	{
-		/// An account was created with some free balance.
+		/// An account was created with some free balance. \[account, free_balance\]
 		Endowed(AccountId, Balance),
 		/// An account was removed whose balance was non-zero but below ExistentialDeposit,
-		/// resulting in an outright loss.
+		/// resulting in an outright loss. \[account, balance\]
 		DustLost(AccountId, Balance),
-		/// Transfer succeeded (from, to, value).
+		/// Transfer succeeded. \[from, to, value\]
 		Transfer(AccountId, AccountId, Balance),
-		/// A balance was set by root (who, free, reserved).
+		/// A balance was set by root. \[who, free, reserved\]
 		BalanceSet(AccountId, Balance, Balance),
-		/// Some amount was deposited (e.g. for transaction fees).
+		/// Some amount was deposited (e.g. for transaction fees). \[who, deposit\]
 		Deposit(AccountId, Balance),
-		/// Some balance was reserved (moved from free to reserved).
+		/// Some balance was reserved (moved from free to reserved). \[who, value\]
 		Reserved(AccountId, Balance),
-		/// Some balance was unreserved (moved from reserved to free).
+		/// Some balance was unreserved (moved from reserved to free). \[who, value\]
 		Unreserved(AccountId, Balance),
 		/// Some balance was moved from the reserve of the first account to the second account.
 		/// Final argument indicates the destination balance type.
+		/// \[from, to, balance, destination_status\]
 		ReserveRepatriated(AccountId, AccountId, Balance, Status),
 	}
 );
@@ -298,9 +292,9 @@ pub enum Reasons {
 
 impl From<WithdrawReasons> for Reasons {
 	fn from(r: WithdrawReasons) -> Reasons {
-		if r == WithdrawReasons::from(WithdrawReason::TransactionPayment) {
+		if r == WithdrawReasons::from(WithdrawReasons::TRANSACTION_PAYMENT) {
 			Reasons::Fee
-		} else if r.contains(WithdrawReason::TransactionPayment) {
+		} else if r.contains(WithdrawReasons::TRANSACTION_PAYMENT) {
 			Reasons::All
 		} else {
 			Reasons::Misc
@@ -461,7 +455,7 @@ decl_module! {
 		/// - DB Weight: 1 Read and 1 Write to destination account
 		/// - Origin account is already in memory, so no DB operations for them.
 		/// # </weight>
-		#[weight = T::DbWeight::get().reads_writes(1, 1) + 70_000_000]
+		#[weight = T::WeightInfo::transfer()]
 		pub fn transfer(
 			origin,
 			dest: <T::Lookup as StaticLookup>::Source,
@@ -490,7 +484,9 @@ decl_module! {
 		///     - Killing: 35.11 µs
 		/// - DB Weight: 1 Read, 1 Write to `who`
 		/// # </weight>
-		#[weight = T::DbWeight::get().reads_writes(1, 1) + 35_000_000]
+		#[weight = T::WeightInfo::set_balance_creating() // Creates a new account.
+			.max(T::WeightInfo::set_balance_killing()) // Kills an existing account.
+		]
 		fn set_balance(
 			origin,
 			who: <T::Lookup as StaticLookup>::Source,
@@ -532,7 +528,7 @@ decl_module! {
 		/// - Same as transfer, but additional read and write because the source account is
 		///   not assumed to be in the overlay.
 		/// # </weight>
-		#[weight = T::DbWeight::get().reads_writes(2, 2) + 70_000_000]
+		#[weight = T::WeightInfo::force_transfer()]
 		pub fn force_transfer(
 			origin,
 			source: <T::Lookup as StaticLookup>::Source,
@@ -556,7 +552,7 @@ decl_module! {
 		/// - Base Weight: 51.4 µs
 		/// - DB Weight: 1 Read and 1 Write to dest (sender is in overlay already)
 		/// #</weight>
-		#[weight = T::DbWeight::get().reads_writes(1, 1) + 50_000_000]
+		#[weight = T::WeightInfo::transfer_keep_alive()]
 		pub fn transfer_keep_alive(
 			origin,
 			dest: <T::Lookup as StaticLookup>::Source,
@@ -668,6 +664,12 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 
 	/// Update the account entry for `who`, given the locks.
 	fn update_locks(who: &T::AccountId, locks: &[BalanceLock<T::Balance>]) {
+		if locks.len() as u32 > T::MaxLocks::get() {
+			frame_support::debug::warn!(
+				"Warning: A user has more currency locks than expected. \
+				A runtime configuration adjustment may be needed."
+			);
+		}
 		Self::mutate_account(who, |b| {
 			b.misc_frozen = Zero::zero();
 			b.fee_frozen = Zero::zero();
@@ -892,7 +894,7 @@ impl<T: Subtrait<I>, I: Instance> frame_system::Trait for ElevatedTrait<T, I> {
 	type MaximumBlockLength = T::MaximumBlockLength;
 	type AvailableBlockRatio = T::AvailableBlockRatio;
 	type Version = T::Version;
-	type ModuleToIndex = T::ModuleToIndex;
+	type PalletInfo = T::PalletInfo;
 	type OnNewAccount = T::OnNewAccount;
 	type OnKilledAccount = T::OnKilledAccount;
 	type AccountData = T::AccountData;
@@ -905,6 +907,7 @@ impl<T: Subtrait<I>, I: Instance> Trait<I> for ElevatedTrait<T, I> {
 	type ExistentialDeposit = T::ExistentialDeposit;
 	type AccountStore = T::AccountStore;
 	type WeightInfo = <T as Subtrait<I>>::WeightInfo;
+	type MaxLocks = T::MaxLocks;
 }
 
 impl<T: Trait<I>, I: Instance> Currency<T::AccountId> for Module<T, I> where
@@ -1008,7 +1011,7 @@ impl<T: Trait<I>, I: Instance> Currency<T::AccountId> for Module<T, I> where
 				Self::ensure_can_withdraw(
 					transactor,
 					value,
-					WithdrawReason::Transfer.into(),
+					WithdrawReasons::TRANSFER,
 					from_account.free,
 				)?;
 
@@ -1091,7 +1094,7 @@ impl<T: Trait<I>, I: Instance> Currency<T::AccountId> for Module<T, I> where
 
 			// defensive only: overflow should never happen, however in case it does, then this
 			// operation is a no-op.
-			account.free = account.free.checked_add(&value).ok_or(Self::PositiveImbalance::zero())?;
+			account.free = account.free.checked_add(&value).ok_or_else(|| Self::PositiveImbalance::zero())?;
 
 			Ok(PositiveImbalance::new(value))
 		}).unwrap_or_else(|x| x)
@@ -1152,7 +1155,7 @@ impl<T: Trait<I>, I: Instance> Currency<T::AccountId> for Module<T, I> where
 			};
 			account.free = value;
 			Ok(imbalance)
-		}).unwrap_or(SignedImbalance::Positive(Self::PositiveImbalance::zero()))
+		}).unwrap_or_else(|_| SignedImbalance::Positive(Self::PositiveImbalance::zero()))
 	}
 }
 
@@ -1167,7 +1170,7 @@ impl<T: Trait<I>, I: Instance> ReservableCurrency<T::AccountId> for Module<T, I>
 		Self::account(who).free
 			.checked_sub(&value)
 			.map_or(false, |new_balance|
-				Self::ensure_can_withdraw(who, value, WithdrawReason::Reserve.into(), new_balance).is_ok()
+				Self::ensure_can_withdraw(who, value, WithdrawReasons::RESERVE, new_balance).is_ok()
 			)
 	}
 
@@ -1184,7 +1187,7 @@ impl<T: Trait<I>, I: Instance> ReservableCurrency<T::AccountId> for Module<T, I>
 		Self::try_mutate_account(who, |account, _| -> DispatchResult {
 			account.free = account.free.checked_sub(&value).ok_or(Error::<T, I>::InsufficientBalance)?;
 			account.reserved = account.reserved.checked_add(&value).ok_or(Error::<T, I>::Overflow)?;
-			Self::ensure_can_withdraw(&who, value.clone(), WithdrawReason::Reserve.into(), account.free)
+			Self::ensure_can_withdraw(&who, value.clone(), WithdrawReasons::RESERVE, account.free)
 		})?;
 
 		Self::deposit_event(RawEvent::Reserved(who.clone(), value));
@@ -1290,6 +1293,8 @@ where
 {
 	type Moment = T::BlockNumber;
 
+	type MaxLocks = T::MaxLocks;
+
 	// Set a lock on the balance of `who`.
 	// Is a no-op if lock amount is zero or `reasons` `is_none()`.
 	fn set_lock(
@@ -1298,7 +1303,7 @@ where
 		amount: T::Balance,
 		reasons: WithdrawReasons,
 	) {
-		if amount.is_zero() || reasons.is_none() { return }
+		if amount.is_zero() || reasons.is_empty() { return }
 		let mut new_lock = Some(BalanceLock { id, amount, reasons: reasons.into() });
 		let mut locks = Self::locks(who).into_iter()
 			.filter_map(|l| if l.id == id { new_lock.take() } else { Some(l) })
@@ -1317,7 +1322,7 @@ where
 		amount: T::Balance,
 		reasons: WithdrawReasons,
 	) {
-		if amount.is_zero() || reasons.is_none() { return }
+		if amount.is_zero() || reasons.is_empty() { return }
 		let mut new_lock = Some(BalanceLock { id, amount, reasons: reasons.into() });
 		let mut locks = Self::locks(who).into_iter().filter_map(|l|
 			if l.id == id {

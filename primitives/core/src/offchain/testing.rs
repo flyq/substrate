@@ -24,6 +24,7 @@ use std::{
 	collections::{BTreeMap, VecDeque},
 	sync::Arc,
 };
+use crate::OpaquePeerId;
 use crate::offchain::{
 	self,
 	storage::{InMemOffchainStorage, OffchainOverlayedChange, OffchainOverlayedChanges},
@@ -359,7 +360,7 @@ impl offchain::Externalities for TestOffchainExt {
 		if let Some(req) = state.requests.get_mut(&request_id) {
 			let response = req.response
 				.as_mut()
-				.expect(&format!("No response provided for request: {:?}", request_id));
+				.unwrap_or_else(|| panic!("No response provided for request: {:?}", request_id));
 
 			if req.read >= response.len() {
 				// Remove the pending request as per spec.
@@ -374,6 +375,10 @@ impl offchain::Externalities for TestOffchainExt {
 		} else {
 			Err(HttpError::IoError)
 		}
+	}
+
+	fn set_authorized_nodes(&mut self, _nodes: Vec<OpaquePeerId>, _authorized_only: bool) {
+		unimplemented!()
 	}
 }
 

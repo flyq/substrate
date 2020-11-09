@@ -36,10 +36,10 @@ pub trait Currency {}
 
 // Test for:
 // * No default instance
-// * Custom InstantiableTrait
 // * Origin, Inherent, Event
 mod module1 {
 	use super::*;
+	use sp_std::ops::Add;
 
 	pub trait Trait<I>: system::Trait where <Self as system::Trait>::BlockNumber: From<u32> {
 		type Event: From<Event<Self, I>> + Into<<Self as system::Trait>::Event>;
@@ -49,7 +49,7 @@ mod module1 {
 	}
 
 	frame_support::decl_module! {
-		pub struct Module<T: Trait<I>, I: InstantiableThing> for enum Call where
+		pub struct Module<T: Trait<I>, I: Instance> for enum Call where
 			origin: <T as system::Trait>::Origin,
 			system = system,
 			T::BlockNumber: From<u32>
@@ -67,7 +67,7 @@ mod module1 {
 	}
 
 	frame_support::decl_storage! {
-		trait Store for Module<T: Trait<I>, I: InstantiableThing> as Module1 where
+		trait Store for Module<T: Trait<I>, I: Instance> as Module1 where
 			T::BlockNumber: From<u32> + std::fmt::Display
 		{
 			pub Value config(value): T::GenericType;
@@ -79,6 +79,17 @@ mod module1 {
 			build(|config: &Self| {
 				println!("{}", config.test);
 			});
+		}
+	}
+
+	frame_support::decl_error! {
+		pub enum Error for Module<T: Trait<I>, I: Instance> where
+			T::BlockNumber: From<u32>,
+			T::BlockNumber: Add,
+			T::AccountId: AsRef<[u8]>,
+		{
+			/// Test
+			Test,
 		}
 	}
 
@@ -97,7 +108,7 @@ mod module1 {
 
 	pub const INHERENT_IDENTIFIER: InherentIdentifier = *b"12345678";
 
-	impl<T: Trait<I>, I: InstantiableThing> ProvideInherent for Module<T, I> where
+	impl<T: Trait<I>, I: Instance> ProvideInherent for Module<T, I> where
 		T::BlockNumber: From<u32>
 	{
 		type Call = Call<T, I>;
@@ -185,7 +196,7 @@ mod module3 {
 	}
 
 	frame_support::decl_module! {
-		pub struct Module<T: Trait> for enum Call where origin: <T as system::Trait>::Origin {}
+		pub struct Module<T: Trait> for enum Call where origin: <T as system::Trait>::Origin, system=system {}
 	}
 }
 
@@ -242,8 +253,9 @@ impl system::Trait for Runtime {
 	type BlockNumber = BlockNumber;
 	type AccountId = AccountId;
 	type Event = Event;
-	type ModuleToIndex = ();
+	type PalletInfo = ();
 	type Call = Call;
+	type DbWeight = ();
 }
 
 frame_support::construct_runtime!(
